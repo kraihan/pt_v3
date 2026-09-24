@@ -1,0 +1,12 @@
+torch>=2.3
+torchvision
+numpy
+scipy
+pyyaml
+tqdm
+pillow
+diffusers
+torch-fidelity
+huggingface_hub
+wandb
+pytest

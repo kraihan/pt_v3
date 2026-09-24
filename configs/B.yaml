@@ -1,0 +1,99 @@
+# PT-Flow B/2 on ImageNet 256 (SD-VAE latents), initialized from W-Flow B/2.
+# Global batch = 8 GPUs x batch_gen.  Hyperparameter defaults follow the paper (App. M.2).
+name: ptflow_B
+data:
+  cache_path: ${IMAGENET_CACHE_PATH}
+  num_workers: 8
+
+generator:              # must match the W-Flow checkpoint (configs/gen/latent_sota_B_ot_8node.yaml)
+  cond_dim: 768
+  num_classes: 1000
+  input_size: 32
+  in_channels: 4
+  out_channels: 4
+  patch_size: 2
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  use_qknorm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  n_cls_tokens: 16
+  use_bf16: true
+  attn_fp32: false
+  use_remat: false
+  scale_max: 3.0        # |s| bound of the diagonal log-scale head
+
+init:
+  wflow_ckpt: ${WFLOW_ROOT}/checkpoints/latent_sota_B_ot/state_00200000.pt
+  weights: ema
+  noise_code: "fixed:0" # W-Flow's random codes folded into one bias: m_eta is a function of x0
+
+potential:              # phi_theta; trunk copied from the first `depth` W-Flow blocks, zero readout
+  hidden_size: 768
+  depth: 6
+  num_heads: 12
+  mlp_ratio: 4.0
+  n_cls_tokens: 16
+  init_from_generator: true
+
+schedule:
+  eps_max: 0.2
+  eps_min: 0.1
+  eps_schedule: cosine
+  anneal_steps: 30000   # healthy Algorithm-1 steps
+  alpha_def: 0.1
+  alpha_degraded: 0.25
+  n_eta: 1
+  n_eta_degraded: 2
+  n_eta_broken: 4
+  ess_ok: 0.3
+  ess_bad: 0.05
+  ess_ema: 0.9
+  calib_min_steps: 1000
+  calib_max_steps: 20000
+  calib_tol: 0.1
+  calib_check_every: 100
+
+train:
+  seed: 0
+  total_steps: 40000    # Algorithm-1 steps (calibration comes first and is not counted)
+  batch_gen: 32         # per GPU: noise samples for the generator step
+  batch_pot: 16         # per GPU: x0 / x1 pairs for the potential step (x K proposal points)
+  K: 8
+  w_max: 1.0            # generator trained for guidance w in [0, w_max]  (cfg = 1 + w)
+  p_uncond: 0.1
+  generator_mode: full  # eq. 16 through grad phi (HVP); "detach" = fixed-point target
+  lambda_scale: 0.1
+  hutchinson_probes: 1
+  lambda_gauge: 0.01
+  lambda_curv: 0.1      # (A2) hinge on directional curvature below -curv_allow
+  curv_allow: 0.5
+  curv_batch: 8
+  lr_gen: 1.0e-5
+  lr_pot: 1.0e-4
+  lr_calib: 2.0e-4
+  warmup: 1000
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_gen: 0.999
+  ema_pot: 0.999
+  grad_clip: 1.0
+  potential_chunk: 64
+  log_every: 20
+  save_every: 1000
+  keep_last: 2
+  keep_every: 5000
+  eval_every: 5000      # FID-10K of the EMA generator (Mode A); 0 disables
+  eval_samples: 10000
+  eval_cfg_scales: [1.0, 1.2]
+  eval_batch: 64
+
+eval:
+  fid_ref: ${FID_REF_NPZ}
+
+logging:
+  use_wandb: false
+  project: ptflow
