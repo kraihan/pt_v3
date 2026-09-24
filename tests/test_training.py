@@ -13,6 +13,18 @@ from ptflow.schedule import BROKEN, DEGRADING, HEALTHY, PTSchedule
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_open_loop_anneal_cools_while_broken():
+    s = PTSchedule(eps_max=0.2, eps_min=0.005, anneal_steps=4, anneal_on="always", ess_ema=0.0)
+    s.phase = "pt"
+    for _ in range(4):
+        s.observe(0.0)
+    assert s.state == BROKEN and abs(s.eps() - 0.005) < 1e-12
+    t = PTSchedule(anneal_steps=4, ess_ema=0.0)
+    t.phase = "pt"
+    t.observe(0.0)
+    assert t.eps() == t.eps_max                                          # default: only healthy steps cool
+
+
 def test_controller_follows_algorithm_1():
     s = PTSchedule(eps_max=0.2, eps_min=0.1, anneal_steps=10, ess_ema=0.0, calib_min_steps=1, calib_max_steps=5)
     s.observe_calibration(resid_rel=0.05, control_ess=0.9)
@@ -77,11 +89,19 @@ def test_train_resume_and_experiments(tmp_path, wflow_ckpt):
     subprocess.run(base + ["-o", "train.total_steps=5"], check=True, cwd=ROOT)
     assert json.loads((run / "status.json").read_text())["pt_step"] == 5
     ckpt = sorted((run / "checkpoints").glob("state_*.pt"))[-1]
+    assert sorted(p.name for p in (run / "checkpoints").glob("calib_state_*.pt"))   # calibration-exit checkpoint
+    out = tmp_path / "exp"
     for exp in ("proposals", "eps-sweep", "prox", "mismatch", "nll"):
-        subprocess.run([sys.executable, str(ROOT / "experiments.py"), exp, "--ckpt", str(ckpt), "--out", str(tmp_path / "exp"),
-                        "--n", "2", "--batch", "2", "--K", "4", "--ks", "2,4", "--probes", "1", "--eps-list", "0.2,0.1",
-                        "--k-outer", "2", "--k-inner", "2", "--seeds", "1", "--refine", "1"], check=True, cwd=ROOT)
-        assert (tmp_path / "exp" / f"{exp.replace('-', '_')}.json").exists()
+        for scale in ("learned", "hutchinson"):
+            subprocess.run([sys.executable, str(ROOT / "experiments.py"), exp, "--ckpt", str(ckpt), "--out", str(out),
+                            "--scale", scale, "--hutch-probes", "1", "--n", "2", "--batch", "2", "--K", "4", "--ks", "2,4",
+                            "--probes", "1", "--eps-list", "0.2,0.1", "--k-outer", "2", "--k-inner", "2", "--seeds", "2",
+                            "--refine", "1", "--shifts", "0,0.01", "--scales", "0.9,1"], check=True, cwd=ROOT)
+        assert (out / f"{exp.replace('-', '_')}.json").exists() and (out / f"{exp.replace('-', '_')}_raw.npz").exists()
+    subprocess.run([sys.executable, str(ROOT / "scripts/make_figures.py"), str(out), "--train-log", str(run / "metrics.jsonl")],
+                   check=True, cwd=ROOT)
+    for name in ("fig1_proposals", "fig2_eps", "fig3_prox", "fig4_mismatch", "fig5_nll"):
+        assert (out / "figures" / f"{name}.pdf").exists()
 
 
 def test_jacobian_audit_matches_autograd(smoke_cfg, wflow_ckpt):

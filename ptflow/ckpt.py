@@ -38,6 +38,21 @@ def save(workdir: str, step: int, payload: Dict, *, keep_last: int = 2, keep_eve
     dist.barrier()
 
 
+def save_named(workdir: str, name: str, payload: Dict) -> Path:
+    """Permanent checkpoint under a name outside the state_*.pt rotation (never deleted; not used for resume)."""
+    if name.startswith("state_"):
+        raise ValueError("Named checkpoints must not use the rotated state_ prefix")
+    path = Path(workdir, "checkpoints", name)
+    dist.barrier()
+    if dist.is_main():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+    dist.barrier()
+    return path
+
+
 def load(path: str | Path) -> Dict:
     return torch.load(str(path), map_location="cpu", weights_only=False)
 

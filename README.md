@@ -104,6 +104,36 @@ python experiments.py nll       --ckpt $C --out results/B   # latent NLL over (K
 python experiments.py toy                 --out results/toy # exact T_eps vs prox by quadrature (O(eps) gap)
 ```
 
+## Paper figures (mechanism, on the real model)
+
+All five are measured on a PT-Flow checkpoint: ImageNet noise/labels or held-out ImageNet latents,
+d = 4096. Each point is a mean over examples with a bootstrap 95% CI.
+
+| Fig | Experiment | Shows |
+|---|---|---|
+| 1 | `proposals` | naive vs recentred vs curvature-scaled vs full defensive proposal: control ESS, Var(log w), χ² vs K |
+| 2 | `eps-sweep` | Var(log w) and ESS vs ε for the four proposals, fitted slopes, the ½‖B‖² mismatch floor (+ an annealing run's trajectory) |
+| 3 | `prox`, `eps-sweep` | prox-residual distribution, Mode-B refinement, and the T_ε − m gap vs ε |
+| 4 | `mismatch` | centre shift / variance scaling vs α, against the closed-form Gaussian prediction |
+| 5 | `nll` | held-out latent NLL over (K_outer × K_inner) budgets and seeds |
+
+```bash
+# the calibrated checkpoint: generator = W-Flow weights, potential fitted; scale head not yet trained
+sbatch -p work1 --gpus=h200:1 scripts/figures.sbatch runs/B/checkpoints/calib_state_XXXXXXXX.pt results/fig_calib hutchinson
+# after Algorithm 1: the best FID point, with the learned scale head
+sbatch -p work1 --gpus=h200:1 scripts/figures.sbatch runs/B/checkpoints/eval_state_XXXXXXXX.pt results/fig_final learned
+```
+
+For the training-dynamics panel of Fig. 2, run a short open-loop annealing run. Start it from the full
+calibration state copied into a new run folder (the trainer resumes from it). Then pass its log to the figure job.
+
+```bash
+mkdir -p runs/B_eps/checkpoints && cp runs/B/checkpoints/calib_state_XXXXXXXX.pt runs/B_eps/checkpoints/state_XXXXXXXX.pt
+sbatch ... scripts/train.sbatch configs/B.yaml runs/B_eps -o train.total_steps=5000 -o schedule.anneal_on=always \
+    -o schedule.eps_max=0.2 -o schedule.eps_min=0.005 -o schedule.anneal_steps=4000 -o train.eval_every=0
+python scripts/make_figures.py results/fig_calib --train-log runs/B_eps/metrics.jsonl
+```
+
 ## What to watch
 
 These are in `metrics.jsonl` (and W&B when `logging.use_wandb: true`); `status.json` holds the latest values.

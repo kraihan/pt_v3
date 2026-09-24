@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import time
 from pathlib import Path
@@ -137,6 +138,7 @@ def main() -> None:
         x0 = torch.randn((tc["batch_gen"], *shape), generator=rng, device=device)
         eps = sched.eps()
         metrics = {}
+        calibrated_now = False
 
         if sched.phase == "calibrate":
             # ---- stage 0: make the W-Flow generator the prox of the potential -------------------
@@ -165,7 +167,8 @@ def main() -> None:
                 ess = dist.mean_scalar(float(weight_stats(est.log_w)["control_ess"].mean()), device)
                 metrics["calib/control_ess"] = ess
             sched.observe_calibration(resid, ess)
-            if sched.phase == "pt" and dist.is_main():
+            calibrated_now = sched.phase == "pt"
+            if calibrated_now and dist.is_main():
                 print(f"[calibration] {sched.calib_exit}", flush=True)
                 logger.write_json("calibration.json", {"exit": sched.calib_exit, "step": step, **sched.metrics()})
         else:
@@ -213,6 +216,12 @@ def main() -> None:
             ess = dist.mean_scalar(float(weight_stats(est.log_w)["control_ess"].mean()), device)
             sched.observe(ess)
         step += 1
+        if calibrated_now:
+            # Full, permanent checkpoint at the calibrated pair (generator still exactly W-Flow):
+            # the reference point for the mechanism figures and the start of any secondary run.
+            path = ckpt.save_named(workdir, f"calib_state_{step:08d}.pt", payload_now())
+            if dist.is_main():
+                print(f"[calibration] saved {path}", flush=True)
 
         if step % int(tc.get("log_every", 20)) == 0 or step == 1:
             metrics.update(sched.metrics())
@@ -231,13 +240,21 @@ def main() -> None:
         eval_every = int(tc.get("eval_every", 0))
         if eval_every and sched.phase == "pt" and sched.pt_step % eval_every == 0 and sched.pt_step > 0:
             from ptflow.evaluate import evaluate_fid
+            # The exact EMA weights being scored, kept permanently so the best FID point can be reused.
+            eval_ckpt = ckpt.save_named(workdir, f"eval_state_{step:08d}.pt", {
+                "step": step, "config": cfg, "init_info": info, "schedule": sched.state_dict(),
+                "generator_ema": ckpt.module_state(gen_ema), "potential_ema": ckpt.module_state(pot_ema)})
             for cs in tc.get("eval_cfg_scales", [1.0]):
                 res = evaluate_fid(gen_ema, pot_ema, num_samples=int(tc.get("eval_samples", 10000)), cfg_scale=cs,
                                    mode="A", seed=0, batch=int(tc.get("eval_batch", 64)), device=device,
                                    ref_path=cfg["eval"]["fid_ref"])
                 if dist.is_main():
                     logger.log(step, {f"fid/cfg{cs}": res["fid"], f"is/cfg{cs}": res["is_mean"]})
-                    print(f"[fid] step {step} cfg {cs}: {res['fid']:.3f}", flush=True)
+                    with Path(workdir, "fid_history.jsonl").open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"step": step, "pt_step": sched.pt_step, "cfg_scale": cs, "fid": res["fid"],
+                                            "is": res["is_mean"], "num_samples": res["num_samples"],
+                                            "ckpt": str(eval_ckpt)}) + "\n")
+                    print(f"[fid] step {step} (pt {sched.pt_step}) cfg {cs}: {res['fid']:.3f} -> {eval_ckpt}", flush=True)
         if step % 10 == 0 and save_request(workdir, device):
             save()
             if dist.is_main():

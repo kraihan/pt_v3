@@ -31,6 +31,7 @@ class PTSchedule:
     eps_min: float = 0.1
     eps_schedule: str = "cosine"          # cosine | linear | exp | constant
     anneal_steps: int = 50000             # counted in healthy Algorithm-1 steps
+    anneal_on: str = "healthy"            # "healthy" (Alg. 1) | "always" (open loop, e.g. an eps-sweep run)
     alpha_def: float = 0.1
     alpha_degraded: float = 0.25
     n_eta: int = 1
@@ -106,11 +107,12 @@ class PTSchedule:
         self.ess_value = self._ema(self.ess_value, control_ess)
         if self.ess_value >= self.ess_ok:
             self.state = HEALTHY
-            self.anneal_progress += 1
         elif self.ess_value >= self.ess_bad:
             self.state = DEGRADING
         else:
             self.state = BROKEN
+        if self.state == HEALTHY or self.anneal_on == "always":
+            self.anneal_progress += 1
         self.pt_step += 1
         return self.state
 
@@ -134,4 +136,7 @@ def build_schedule(cfg: dict) -> PTSchedule:
     unknown = set(cfg) - known
     if unknown:
         raise ValueError(f"Unknown schedule keys: {sorted(unknown)}")
-    return PTSchedule(**cfg)
+    sched = PTSchedule(**cfg)
+    if sched.anneal_on not in ("healthy", "always"):
+        raise ValueError(f"anneal_on must be 'healthy' or 'always', got {sched.anneal_on!r}")
+    return sched

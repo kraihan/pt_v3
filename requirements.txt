@@ -9,4 +9,5 @@ diffusers
 torch-fidelity
 huggingface_hub
 wandb
+matplotlib
 pytest
