@@ -40,7 +40,8 @@ from ptflow.losses import hutchinson_diag
 from ptflow.models.potential import guided_hvp, prox_energy, prox_residual
 
 PROPOSALS = ("naive", "recentered", "curvature", "full")
-METRICS = ("control_ess", "ess_frac", "var_logw", "log10_1pchi2", "max_w")
+METRICS = ("control_ess", "ess_frac", "var_logw", "log10_kstar", "log10_1pchi2_plugin", "max_w")
+COLLAPSED = 0.05          # control ESS below this: the weights are a single draw
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,28 @@ def proposal_scale(a, pot, m, c, s_learned, g) -> torch.Tensor:
                       for i in range(0, len(m), a.batch)])
 
 
+def proposal_centre(a, pot, x0, c, m) -> torch.Tensor:
+    """The proposal centre: m_eta (amortized) or prox_phi(x0) refined from m_eta (--center refined).
+
+    The refined centre isolates the estimator (Thm 3.9 is stated at the prox) from how well
+    the generator tracks the prox (Fig. 3).
+    """
+    if a.center == "amortized":
+        return m
+    from ptflow.sampling import refine
+    return torch.cat([refine(pot, m[i:i + a.batch], x0[i:i + a.batch], c[i:i + a.batch], 0.0,
+                             steps=a.refine_center_steps)[0] for i in range(0, len(m), a.batch)])
+
+
+def centre_residual(a, pot, x0, c, y) -> Dict[str, float]:
+    """Prox residual of a proposal centre: relative to the displacement, and absolute RMS per coordinate."""
+    r = torch.cat([prox_residual(pot, y[i:i + a.batch], x0[i:i + a.batch], c[i:i + a.batch], 0.0).detach()
+                   for i in range(0, len(y), a.batch)])
+    rn = r.flatten(1).norm(dim=1)
+    return {"rel": float((rn / (y - x0).flatten(1).norm(dim=1).clamp_min(1e-6)).mean()),
+            "rms": float((rn / y[0].numel() ** 0.5).mean())}
+
+
 def proposal_spec(name: str, x0, m, s, alpha: float):
     """(centre, log-scale, defensive alpha) of each proposal."""
     return {"naive": (x0, None, 1.0), "recentered": (m, None, 0.0),
@@ -115,7 +138,7 @@ def log_weights(pot, x0, c, center, s, alpha: float, eps: float, z, u, chunk: in
 
 
 def batched_log_weights(a, pot, x0, c, center, s, alpha, eps, z, u, m=None):
-    """Log-weights for all examples; with ``m`` also the per-example gap |T_eps_hat - m| / sqrt(d)."""
+    """Log-weights [n, K], the Laplace-component mask [n, K], and (with ``m``) |T_eps_hat - m| / sqrt(d)."""
     lws, gaps = [], []
     for i in range(0, len(x0), a.batch):
         sl = slice(i, i + a.batch)
@@ -126,24 +149,45 @@ def batched_log_weights(a, pot, x0, c, center, s, alpha, eps, z, u, m=None):
             wn = torch.softmax(lw, dim=1).to(y.dtype).view(*lw.shape, *([1] * (y.ndim - 2)))
             t_hat = (wn * y).sum(1)                     # SNIS bridge conditional mean E[X1 | x0]
             gaps.append((t_hat - m[sl]).flatten(1).norm(dim=1) / m[0].numel() ** 0.5)
-    return torch.cat(lws), (torch.cat(gaps) if gaps else None)
+    tilt = (u >= alpha) if 0.0 < alpha < 1.0 else torch.ones_like(u, dtype=torch.bool)
+    return torch.cat(lws), tilt, (torch.cat(gaps) if gaps else None)
 
 
-def per_example(lw: torch.Tensor) -> Dict[str, np.ndarray]:
-    """Per-example weight diagnostics; chi2 is carried as log10(1 + chi2) = log10(E w^2 / (E w)^2)."""
+def per_example(lw: torch.Tensor, tilt: torch.Tensor, alpha: float) -> Dict[str, np.ndarray]:
+    """Per-example weight diagnostics.
+
+    var_logw       Var(log w) over draws from the Laplace component: the s_res^2 of Thm 3.9.  For a
+                   defensive mixture the variance over all draws is dominated by the gap between the two
+                   components (harmless near-zero weights) and says nothing about the tilt.
+    log10_kstar    draws needed, log10(1 + chi2) under the log-normal approximation of Prop. 3.7,
+                   1 + chi2 = e^{s^2}, with the defensive bound 1 + chi2_def <= e^{s^2} / (1 - alpha)
+                   (Sec. 3.5).  Independent of K.
+    log10_1pchi2_plugin  the plug-in mean(w^2)/mean(w)^2; bounded by K, so it only measures K once the
+                   weights have collapsed (flagged by ``saturated``).
+    """
     st = weight_stats(lw)
-    lw = lw.double()
+    lw, tilt = lw.double(), tilt[:, : lw.shape[1]]
     K = lw.shape[1]
+    cnt = tilt.sum(1).double()
+    mean_t = torch.where(tilt, lw, 0.0).sum(1) / cnt.clamp_min(1)
+    var_t = torch.where(tilt, (lw - mean_t[:, None]) ** 2, 0.0).sum(1) / cnt.clamp_min(1)
+    var_t = torch.where(cnt >= 2, var_t, torch.full_like(var_t, float("nan")))
+    a = alpha if 0.0 < alpha < 1.0 else 0.0
     l1, l2 = torch.logsumexp(lw, 1), torch.logsumexp(2 * lw, 1)
-    log_1pchi2 = (l2 - math.log(K)) - 2 * (l1 - math.log(K))
-    out = {k: st[k].cpu().numpy() for k in ("control_ess", "ess_frac", "var_logw", "max_w")}
-    out["log10_1pchi2"] = (log_1pchi2 / math.log(10)).cpu().numpy()
+    out = {k: st[k].cpu().numpy() for k in ("control_ess", "ess_frac", "max_w")}
+    out["var_logw"] = var_t.cpu().numpy()
+    out["log10_kstar"] = ((var_t - math.log1p(-a)) / math.log(10)).cpu().numpy()
+    out["log10_1pchi2_plugin"] = (((l2 - math.log(K)) - 2 * (l1 - math.log(K))) / math.log(10)).cpu().numpy()
+    out["saturated"] = (st["control_ess"] < COLLAPSED).double().cpu().numpy()
     out["nonfinite"] = (~torch.isfinite(lw).all(1)).double().cpu().numpy()
     return out
 
 
 def boot_ci(x: np.ndarray, rng, n_boot: int = 1000):
     x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return float("nan"), float("nan"), float("nan")
     means = x[rng.integers(0, len(x), (n_boot, len(x)))].mean(1)
     return float(x.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
@@ -153,10 +197,11 @@ def summarize(pe: Dict[str, np.ndarray], K: int, rng) -> Dict[str, float]:
     for k in METRICS:
         out[k], out[f"{k}_lo"], out[f"{k}_hi"] = boot_ci(pe[k], rng)
     out["control_ess_median"] = float(np.median(pe["control_ess"]))
+    out["collapsed_frac"] = float(pe["saturated"].mean())
     out["nonfinite_rate"] = float(pe["nonfinite"].mean())
-    med = float(np.median(pe["log10_1pchi2"]))            # budget K* ~ chi2 / delta^2 (Sec. 3.5)
-    log10_chi2 = med if med > 1 else math.log10(max(10**med - 1, 1e-12))   # chi2 ~ 1 + chi2 once it is large
-    for delta in (0.1, 0.05):
+    med = float(np.nanmedian(pe["log10_kstar"])) if np.isfinite(pe["log10_kstar"]).any() else float("nan")
+    log10_chi2 = med if med > 1 else math.log10(max(10**med - 1, 1e-12))
+    for delta in (0.1, 0.05):                              # budget K* ~ chi2 / delta^2 (Sec. 3.5)
         out[f"log10_budget_delta{delta}"] = max(0.0, log10_chi2 - 2 * math.log10(delta))
     return out
 
@@ -168,8 +213,22 @@ def load(a, device):
 
 
 def meta(a, step, eps=None, **kw):
-    return {"checkpoint": a.ckpt, "step": step, "n": a.n, "scale": a.scale, "alpha": a.alpha,
+    return {"checkpoint": a.ckpt, "step": step, "n": a.n, "scale": a.scale, "alpha": a.alpha, "center": a.center,
             **({"eps": eps} if eps is not None else {}), **kw}
+
+
+def setup(a, device, w: float = 0.0):
+    """Model, inputs, proposal centre and scale shared by Figs 1, 2 and 4."""
+    gen, pot, sched, step = load(a, device)
+    x0, c, m, s, g = inputs(gen, a.n, a.seed, device, w)
+    centre = proposal_centre(a, pot, x0, c, m)
+    s = proposal_scale(a, pot, centre, c, s, g)
+    r = centre_residual(a, pot, x0, c, m)
+    info = {"generator_resid_rel": r["rel"], "generator_resid_rms": r["rms"]}
+    if a.center == "refined":
+        r = centre_residual(a, pot, x0, c, centre)
+        info.update(centre_resid_rel=r["rel"], centre_resid_rms=r["rms"])
+    return gen, pot, sched, step, x0, c, m, centre, s, g, info
 
 
 # ---------------------------------------------------------------------------
@@ -177,25 +236,23 @@ def meta(a, step, eps=None, **kw):
 # ---------------------------------------------------------------------------
 
 def exp_proposals(a, device):
-    gen, pot, sched, step = load(a, device)
+    gen, pot, sched, step, x0, c, m, centre, s, g, info = setup(a, device)
     eps = a.eps or sched.eps()
     ks = [int(k) for k in a.ks.split(",")]
-    x0, c, m, s, g = inputs(gen, a.n, a.seed, device)
-    s = proposal_scale(a, pot, m, c, s, g)
     z, u = crn_draws(x0, max(ks), g)
     rng = np.random.default_rng(a.seed)
     rows, raw = [], {}
     for name in PROPOSALS:
-        center, scale, alpha = proposal_spec(name, x0, m, s, a.alpha)
+        center, scale, alpha = proposal_spec(name, x0, centre, s, a.alpha)
         t0 = time.time()
-        lw, _ = batched_log_weights(a, pot, x0, c, center, scale, alpha, eps, z, u)
+        lw, tilt, _ = batched_log_weights(a, pot, x0, c, center, scale, alpha, eps, z, u)
         seconds = (time.time() - t0) / a.n
         for k in ks:
-            pe = per_example(lw[:, :k])
+            pe = per_example(lw[:, :k], tilt, alpha)
             rows.append({"proposal": name, "K": k, "eps": eps, "alpha": alpha, "sec_per_example": seconds,
                          **summarize(pe, k, rng)})
             raw.update({f"{name}|K{k}|{m_}": v for m_, v in pe.items()})
-    write(Path(a.out), "proposals", rows, meta(a, step, eps, ks=ks, rows=rows), raw)
+    write(Path(a.out), "proposals", rows, meta(a, step, eps, ks=ks, **info, rows=rows), raw)
 
 
 # ---------------------------------------------------------------------------
@@ -219,26 +276,27 @@ def laplace_mismatch(pot, m, c, s, probes: int, g) -> torch.Tensor:
 
 
 def exp_eps_sweep(a, device):
-    gen, pot, sched, step = load(a, device)
+    gen, pot, sched, step, x0, c, m, centre, s, g, info = setup(a, device)
     eps_list = [float(e) for e in a.eps_list.split(",")]
-    x0, c, m, s, g = inputs(gen, a.n, a.seed, device)
-    s = proposal_scale(a, pot, m, c, s, g)
     z, u = crn_draws(x0, a.K, g)
     rng = np.random.default_rng(a.seed)
     rows, raw = [], {}
     for eps in eps_list:
         for name in PROPOSALS:
-            center, scale, alpha = proposal_spec(name, x0, m, s, a.alpha)
-            lw, gap = batched_log_weights(a, pot, x0, c, center, scale, alpha, eps, z, u, m=m)
-            pe = per_example(lw)
-            pe["tgap_rms"] = gap.cpu().numpy()
+            center, scale, alpha = proposal_spec(name, x0, centre, s, a.alpha)
+            lw, tilt, gap = batched_log_weights(a, pot, x0, c, center, scale, alpha, eps, z, u, m=m)
+            pe = per_example(lw, tilt, alpha)
+            # T_eps_hat is only an estimate where the weights have not collapsed onto one draw.
+            gap = gap.cpu().numpy()
+            pe["tgap_rms"] = np.where(pe["control_ess"] >= COLLAPSED, gap, np.nan)
             row = {"eps": eps, "eps_times_d": eps * m[0].numel(), "proposal": name, "K": a.K, **summarize(pe, a.K, rng)}
             row["tgap_rms"], row["tgap_rms_lo"], row["tgap_rms_hi"] = boot_ci(pe["tgap_rms"], rng)
+            row["tgap_valid_frac"] = float(np.isfinite(pe["tgap_rms"]).mean())
             rows.append(row)
             raw.update({f"{name}|eps{eps}|{k}": v for k, v in pe.items()})
     mism = {}
     for label, sc in (("proposal_scale", s), ("identity_scale", None)):
-        vals = torch.cat([laplace_mismatch(pot, m[i:i + a.batch], c[i:i + a.batch],
+        vals = torch.cat([laplace_mismatch(pot, centre[i:i + a.batch], c[i:i + a.batch],
                                            None if sc is None else sc[i:i + a.batch], a.probes, g)
                           for i in range(0, a.n, a.batch)]).cpu().numpy()
         mean, lo, hi = boot_ci(vals, rng)
@@ -250,12 +308,12 @@ def exp_eps_sweep(a, device):
         per = np.stack([raw[f"{name}|eps{e}|var_logw"] for e in eps_list])       # [E, n]
 
         def slope(idx):
-            return float(np.polyfit(le, np.log(np.clip(per[:, idx].mean(1), 1e-12, None)), 1)[0])
+            return float(np.polyfit(le, np.log(np.clip(np.nanmean(per[:, idx], 1), 1e-12, None)), 1)[0])
         boot = [slope(rng.integers(0, per.shape[1], per.shape[1])) for _ in range(500)]
         slopes[name] = {"slope": slope(np.arange(per.shape[1])),
                         "ci95": [float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))]}
     write(Path(a.out), "eps_sweep", rows,
-          meta(a, step, K=a.K, eps_list=eps_list, laplace_mismatch_half_frobenius_sq=mism, slopes=slopes,
+          meta(a, step, K=a.K, eps_list=eps_list, laplace_mismatch_half_frobenius_sq=mism, slopes=slopes, **info,
                theory="naive: Var ~ |grad phi|^2 / (2 eps) (slope -1); tilted: Var <= eps (...) (slope +1) "
                       "only if the mismatch term is O(eps)", rows=rows), raw)
 
@@ -306,10 +364,9 @@ def exp_mismatch(a, device):
       centre shift delta (in proposal std per coordinate):  extra Var(log w) = |delta * dir / e^{s/2}|^2
       variance multiplier kappa:                          extra Var(log w) = (d / 2) (kappa - 1)^2
     """
-    gen, pot, sched, step = load(a, device)
+    gen, pot, sched, step, x0, c, m, centre, s, g, info = setup(a, device)
     eps = a.eps or sched.eps()
-    x0, c, m, s, g = inputs(gen, a.n, a.seed, device)
-    s = proposal_scale(a, pot, m, c, s, g)
+    m = centre
     if s is None:
         s = torch.zeros_like(m)
     z, u = crn_draws(x0, a.K, g)
@@ -322,14 +379,14 @@ def exp_mismatch(a, device):
         for kind, delta, kappa in grid:
             center = m + delta * math.sqrt(2 * eps) * direction
             scale = s + math.log(kappa)
-            lw, _ = batched_log_weights(a, pot, x0, c, center, scale, alpha, eps, z, u)
-            pe = per_example(lw)
+            lw, tilt, _ = batched_log_weights(a, pot, x0, c, center, scale, alpha, eps, z, u)
+            pe = per_example(lw, tilt, alpha)
             pred_shift = float((delta * direction * torch.exp(-0.5 * s)).flatten(1).square().sum(1).mean())
             rows.append({"alpha": alpha, "kind": kind, "center_shift_std": delta, "variance_multiplier": kappa,
                          "pred_extra_var_logw": pred_shift if kind == "shift" else 0.5 * d * (kappa - 1) ** 2,
                          **summarize(pe, a.K, rng)})
             raw.update({f"a{alpha}|{kind}|{delta}|{kappa}|{k}": v for k, v in pe.items()})
-    write(Path(a.out), "mismatch", rows, meta(a, step, eps, K=a.K, rows=rows), raw)
+    write(Path(a.out), "mismatch", rows, meta(a, step, eps, K=a.K, **info, rows=rows), raw)
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +556,9 @@ def main():
     ap.add_argument("--scale", default="learned", choices=["learned", "hutchinson"],
                     help="diagonal proposal scale: the generator's head, or Hutchinson on the potential")
     ap.add_argument("--hutch-probes", type=int, default=16)
+    ap.add_argument("--center", default="amortized", choices=["amortized", "refined"],
+                    help="proposal centre: the generator output m, or prox_phi refined from m")
+    ap.add_argument("--refine-center-steps", type=int, default=50)
     ap.add_argument("--ws", default="0,0.2,1.0")
     ap.add_argument("--refine", default="1,3,10")
     ap.add_argument("--shifts", default="0,0.002,0.005,0.01,0.02,0.05,0.1")

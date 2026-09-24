@@ -92,9 +92,9 @@ def test_train_resume_and_experiments(tmp_path, wflow_ckpt):
     assert sorted(p.name for p in (run / "checkpoints").glob("calib_state_*.pt"))   # calibration-exit checkpoint
     out = tmp_path / "exp"
     for exp in ("proposals", "eps-sweep", "prox", "mismatch", "nll"):
-        for scale in ("learned", "hutchinson"):
+        for scale, centre in (("learned", "amortized"), ("hutchinson", "refined")):
             subprocess.run([sys.executable, str(ROOT / "experiments.py"), exp, "--ckpt", str(ckpt), "--out", str(out),
-                            "--scale", scale, "--hutch-probes", "1", "--n", "2", "--batch", "2", "--K", "4", "--ks", "2,4",
+                            "--scale", scale, "--center", centre, "--refine-center-steps", "2", "--hutch-probes", "1", "--n", "2", "--batch", "2", "--K", "4", "--ks", "2,4",
                             "--probes", "1", "--eps-list", "0.2,0.1", "--k-outer", "2", "--k-inner", "2", "--seeds", "2",
                             "--refine", "1", "--shifts", "0,0.01", "--scales", "0.9,1"], check=True, cwd=ROOT)
         assert (out / f"{exp.replace('-', '_')}.json").exists() and (out / f"{exp.replace('-', '_')}_raw.npz").exists()
@@ -102,6 +102,30 @@ def test_train_resume_and_experiments(tmp_path, wflow_ckpt):
                    check=True, cwd=ROOT)
     for name in ("fig1_proposals", "fig2_eps", "fig3_prox", "fig4_mismatch", "fig5_nll"):
         assert (out / "figures" / f"{name}.pdf").exists()
+
+
+def test_mechanism_metrics_positive_control(tmp_path, smoke_cfg, wflow_ckpt):
+    """phi == 0: the target is N(x0, 2 eps I) and prox = x0.  Refined-centre proposals must be exact
+    (control ESS 1, s^2 ~ 0); the generator-centred ones must collapse."""
+    from ptflow.build import init_from_wflow
+    from ptflow.schedule import build_schedule
+    smoke_cfg["init"]["wflow_ckpt"] = str(wflow_ckpt)
+    gen, pot = build_generator(smoke_cfg), build_potential(smoke_cfg)
+    init_from_wflow(gen, pot, smoke_cfg)
+    ck = tmp_path / "pc.pt"
+    torch.save({"step": 0, "config": smoke_cfg, "schedule": build_schedule(smoke_cfg["schedule"]).state_dict(),
+                "generator_ema": gen.state_dict(), "potential_ema": pot.state_dict()}, ck)
+    res = {}
+    for centre in ("amortized", "refined"):
+        out = tmp_path / centre
+        subprocess.run([sys.executable, str(ROOT / "experiments.py"), "proposals", "--ckpt", str(ck), "--out", str(out),
+                        "--scale", "hutchinson", "--hutch-probes", "2", "--center", centre, "--refine-center-steps", "30",
+                        "--n", "8", "--batch", "8", "--ks", "8"], check=True, cwd=ROOT)
+        res[centre] = {r["proposal"]: r for r in json.loads((out / "proposals.json").read_text())["rows"]}
+    for name in ("recentered", "curvature", "full"):
+        assert res["refined"][name]["control_ess"] > 0.99 and res["refined"][name]["var_logw"] < 1e-6
+        assert res["amortized"][name]["var_logw"] > 10
+    assert res["amortized"]["naive"]["control_ess"] > 0.99
 
 
 def test_jacobian_audit_matches_autograd(smoke_cfg, wflow_ckpt):

@@ -95,12 +95,16 @@ def legend_below(fig, ax, ncol=4):
     fig.legend(handles, labels, loc="outside lower center", ncol=ncol)
 
 
-def adaptive_xscale(ax, values):
-    v = np.asarray([x for x in values if x > 0], float)
+def adaptive_xscale(ax, values, axis="x"):
+    v = np.asarray([x for x in values if np.isfinite(x) and x > 0], float)
+    target = ax.xaxis if axis == "x" else ax.yaxis
     if len(v) and v.max() / v.min() > 20:
-        ax.set_xscale("log")
+        (ax.set_xscale if axis == "x" else ax.set_yscale)("log")
     else:
-        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
+        target.set_major_locator(matplotlib.ticker.MaxNLocator(3))
+        span = (v.max() - v.min()) if len(v) > 1 else 1.0
+        decimals = min(4, max(0, int(math.ceil(-math.log10(max(span, 1e-12)))) + 1))
+        target.set_major_formatter(matplotlib.ticker.FormatStrFormatter(f"%.{decimals}f"))
 
 
 def read_log(path):
@@ -115,41 +119,80 @@ def read_log(path):
 
 # ---------------------------------------------------------------------------
 
+def hbars(ax, names, vals, lo, hi, *, log=False, fmt="{:.3g}"):
+    """One thin horizontal bar per proposal, value label in neutral ink."""
+    y = np.arange(len(names))[::-1]
+    for yi, n, v, l, h in zip(y, names, vals, lo, hi):
+        col = PROPOSAL_STYLE[n][0]
+        if not np.isfinite(v):
+            ax.text(0.02, yi, "n/a (too few draws)", transform=ax.get_yaxis_transform(), va="center",
+                    fontsize=6.5, color=INK2)
+            continue
+        ax.barh(yi, v, height=0.55, color=col, edgecolor="white", linewidth=1.0)
+        end = v
+        if np.isfinite(l) and np.isfinite(h):
+            ax.plot([l, h], [yi, yi], color=INK2, lw=0.8)
+            end = max(v, h)
+        ax.annotate(fmt.format(v), (end, yi), xytext=(3, 0), textcoords="offset points", va="center",
+                    fontsize=6.5, color=INK2, annotation_clip=False)
+    ax.set_yticks(y)
+    ax.set_yticklabels([PROPOSAL_STYLE[n][2] for n in names])
+    ax.grid(axis="y", visible=False)
+    if log:
+        ax.set_xscale("log")
+        ax.xaxis.set_major_locator(matplotlib.ticker.LogLocator(numticks=4))
+        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax.margins(x=0.25)
+
+
+def centre_note(d):
+    parts = [f"centre: {d.get('center', 'amortized')}", f"scale: {d.get('scale')}"]
+    if "generator_resid_rel" in d:
+        parts.append(f"generator rel. residual {d['generator_resid_rel']:.2g}")
+    if "centre_resid_rms" in d:
+        parts.append(f"refined-centre residual RMS {d['centre_resid_rms']:.2g}/coord")
+    return ", ".join(parts)
+
+
 def fig1(results, out, md):
     d = load(results, "proposals")
     if d is None:
         return
     rows = d["rows"]
-    fig, axes = plt.subplots(1, 3, figsize=(6.6, 2.3), layout="constrained")
+    kmax = max(x["K"] for x in rows)
+    names = list(PROPOSAL_STYLE)
+    at_k = {x["proposal"]: x for x in rows if x["K"] == kmax}
+    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.3), layout="constrained")
     for name, (col, mk, lab) in PROPOSAL_STYLE.items():
         r = sorted((x for x in rows if x["proposal"] == name), key=lambda x: x["K"])
-        k = [x["K"] for x in r]
-        series(axes[0], k, [x["control_ess"] for x in r], [x["control_ess_lo"] for x in r],
-               [x["control_ess_hi"] for x in r], color=col, marker=mk, label=lab)
-        series(axes[1], k, [max(x["var_logw"], 1e-6) for x in r], [max(x["var_logw_lo"], 1e-6) for x in r],
-               [x["var_logw_hi"] for x in r], color=col, marker=mk, label=lab, direct=False)
-        series(axes[2], k, [x["log10_1pchi2"] for x in r], [x["log10_1pchi2_lo"] for x in r],
-               [x["log10_1pchi2_hi"] for x in r], color=col, marker=mk, label=lab, direct=False)
-    for ax in axes:
-        ax.set_xscale("log", base=2)
-        ax.set_xlabel("draws K")
+        series(axes[0], [x["K"] for x in r], [x["control_ess"] for x in r], [x["control_ess_lo"] for x in r],
+               [x["control_ess_hi"] for x in r], color=col, marker=mk, label=lab, direct=False)
+    axes[0].set_xscale("log", base=2)
+    axes[0].set_xlabel("draws K")
     axes[0].set_ylim(-0.02, 1.02)
     axes[0].set_ylabel("control ESS  (ESS−1)/(K−1)")
-    axes[1].set_yscale("log")
-    axes[1].set_ylabel("Var(log w)")
-    axes[2].set_ylabel("log$_{10}$(1+χ²)")
-    panel(axes[0], "a", "weight health")
+    panel(axes[0], "a", "weight health vs K")
+    hbars(axes[1], names, [max(at_k[n]["var_logw"], 1e-6) for n in names],
+          [at_k[n]["var_logw_lo"] for n in names], [at_k[n]["var_logw_hi"] for n in names], log=True)
+    axes[1].set_xlabel("s² = Var(log w)")
     panel(axes[1], "b", "log-weight variance")
-    panel(axes[2], "c", "χ² divergence")
+    hbars(axes[2], names, [at_k[n]["log10_kstar"] for n in names], [at_k[n]["log10_kstar_lo"] for n in names],
+          [at_k[n]["log10_kstar_hi"] for n in names], fmt="10^{:.3g}")
+    axes[2].set_yticklabels([])
+    axes[2].set_xlabel("log$_{10}$ draws needed")
+    panel(axes[2], "c", "draws needed")
     legend_below(fig, axes[0])
     save(fig, out, "fig1_proposals")
-    kmax = max(x["K"] for x in rows)
-    md.append(f"## Fig 1 - proposals (eps={d.get('eps'):.4g}, n={d['n']}, scale={d.get('scale')}, K={kmax})\n")
-    md.append("| proposal | control ESS [95% CI] | Var(log w) | log10(1+chi2) | log10 budget (delta=0.1) |\n|---|---|---|---|---|")
-    for x in rows:
-        if x["K"] == kmax:
-            md.append(f"| {x['proposal']} | {x['control_ess']:.3f} [{x['control_ess_lo']:.3f}, {x['control_ess_hi']:.3f}] "
-                      f"| {x['var_logw']:.3g} | {x['log10_1pchi2']:.3g} | {x['log10_budget_delta0.1']:.2f} |")
+    md.append(f"## Fig 1 - proposals (eps={d.get('eps'):.4g}, n={d['n']}, K={kmax}; {centre_note(d)})\n")
+    md.append("Caption notes: bars at K = %d; s^2 is Var(log w) over Laplace-component draws (Thm 3.9); draws "
+              "needed 1 + chi^2 ~ e^{s^2} / (1 - alpha) (log-normal, Prop. 3.7; defensive bound, Sec. 3.5).\n" % kmax)
+    md.append("| proposal | control ESS [95% CI] | collapsed fraction | s^2 (Laplace draws) | log10 draws needed | "
+              "plug-in log10(1+chi2) (<= log10 K) |\n|---|---|---|---|---|---|")
+    for n in names:
+        x = at_k[n]
+        md.append(f"| {n} | {x['control_ess']:.3f} [{x['control_ess_lo']:.3f}, {x['control_ess_hi']:.3f}] "
+                  f"| {x['collapsed_frac']:.2f} | {x['var_logw']:.3g} | {x['log10_kstar']:.3g} "
+                  f"| {x['log10_1pchi2_plugin']:.3g} |")
     md.append("")
 
 
@@ -169,16 +212,19 @@ def fig2(results, out, md, train_log=None):
         series(axes[1], e, [x["control_ess"] for x in r], [x["control_ess_lo"] for x in r],
                [x["control_ess_hi"] for x in r], color=col, marker=mk, label=lab, direct=False)
         axes[0]._direct[-1] = axes[0]._direct[-1][:2] + (lab,)
-    floor = d["laplace_mismatch_half_frobenius_sq"]["proposal_scale"]["mean"]
-    axes[0].axhline(max(floor, 1e-6), color=INK2, lw=1.0, ls=(0, (4, 2)))
-    axes[0].annotate("mismatch floor ½‖B‖²", (min(x["eps"] for x in rows), max(floor, 1e-6)), xytext=(2, 3),
-                     textcoords="offset points", fontsize=6.5, color=INK2)
+    mm = d["laplace_mismatch_half_frobenius_sq"]
+    for key, ls, text in (("proposal_scale", (0, (4, 2)), "Laplace floor ½‖B‖², proposal scale"),
+                          ("identity_scale", (0, (1, 2)), "Laplace floor, identity scale")):
+        floor = max(mm[key]["mean"], 1e-6)
+        axes[0].axhline(floor, color=INK2, lw=1.0, ls=ls)
+        axes[0].annotate(text, (min(x["eps"] for x in rows), floor), xytext=(2, 3), textcoords="offset points",
+                         fontsize=6.0, color=INK2)
     for ax in axes[:2]:
         ax.set_xscale("log")
         ax.invert_xaxis()
         ax.set_xlabel("ε (decreasing →)")
     axes[0].set_yscale("log")
-    axes[0].set_ylabel("Var(log w)")
+    axes[0].set_ylabel("s² = Var(log w), Laplace draws")
     axes[1].set_ylim(-0.02, 1.02)
     axes[1].set_ylabel("control ESS")
     panel(axes[0], "a", "log-weight variance vs ε")
@@ -201,7 +247,7 @@ def fig2(results, out, md, train_log=None):
             md.append(f"Training log: {len(log)} logged steps, eps {e.max():.3g} -> {e.min():.3g}, "
                       f"final control-ESS EMA {s[-1]:.3g}.\n")
     save(fig, out, "fig2_eps")
-    md.append(f"## Fig 2 - variance vs eps (n={d['n']}, K={d['K']}, scale={d.get('scale')})\n")
+    md.append(f"## Fig 2 - variance vs eps (n={d['n']}, K={d['K']}; {centre_note(d)})\n")
     md.append("| proposal | slope d log Var / d log eps [95% CI] |\n|---|---|")
     for name, sl in d["slopes"].items():
         md.append(f"| {name} | {sl['slope']:+.3f} [{sl['ci95'][0]:+.3f}, {sl['ci95'][1]:+.3f}] |")
@@ -241,13 +287,20 @@ def fig3(results, out, md, train_log=None):
     axes[1].set_ylabel("rel. residual (median, IQR)")
     panel(axes[1], "b", "refinement")
     if sweep is not None:
+        drawn = False
         for name in ("full", "curvature"):
             col, mk, lab = PROPOSAL_STYLE[name]
-            r = sorted((x for x in sweep["rows"] if x["proposal"] == name), key=lambda x: -x["eps"])
-            series(axes[2], [x["eps"] for x in r], [x["tgap_rms"] for x in r], [x["tgap_rms_lo"] for x in r],
-                   [x["tgap_rms_hi"] for x in r], color=col, marker=mk, label=lab)
+            r = sorted((x for x in sweep["rows"] if x["proposal"] == name and x.get("tgap_valid_frac", 1) >= 0.5
+                        and np.isfinite(x["tgap_rms"])), key=lambda x: -x["eps"])
+            if r:
+                drawn = True
+                series(axes[2], [x["eps"] for x in r], [x["tgap_rms"] for x in r], [x["tgap_rms_lo"] for x in r],
+                       [x["tgap_rms_hi"] for x in r], color=col, marker=mk, label=lab)
+        if not drawn:
+            axes[2].text(0.5, 0.5, "weights collapsed at every ε:\nT̂$_ε$ not estimable", transform=axes[2].transAxes,
+                         ha="center", va="center", fontsize=7, color=INK2)
         axes[2].set_xscale("log")
-        axes[2].set_yscale("log")
+        adaptive_xscale(axes[2], [x["tgap_rms"] for x in sweep["rows"] if x["proposal"] in ("full", "curvature")], axis="y")
         axes[2].invert_xaxis()
         axes[2].set_xlabel("ε (decreasing →)")
         axes[2].set_ylabel("RMS  T̂$_ε$(x₀) − m(x₀)")
